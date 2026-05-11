@@ -3,8 +3,8 @@ import websockets
 import json
 import random
 import math
-import hashlib
 from datetime import datetime
+from http import HTTPStatus
 
 # Game state
 rooms = {}
@@ -97,7 +97,7 @@ class Monster:
                 self.y -= (dy/dist) * self.speed if dist > 0 else 0
 
 def create_room(room_id, password=""):
-    level = [row[:] for row in LEVELS[0]]  # Deep copy
+    level = [row[:] for row in LEVELS[0]]
     rooms[room_id] = {
         "players": {},
         "monsters": [Monster(5+i*4, 5+i*3, "stalker") for i in range(3)],
@@ -109,6 +109,7 @@ def create_room(room_id, password=""):
     return rooms[room_id]
 
 async def handle_client(websocket):
+    """WebSocket handler for game connections"""
     player_id = None
     room_id = None
 
@@ -157,7 +158,6 @@ async def handle_client(websocket):
                     }))
                     continue
 
-                # Find spawn point
                 spawn_x, spawn_y = 2.5, 2.5
                 for y, row in enumerate(room["level_data"]):
                     for x, cell in enumerate(row):
@@ -232,7 +232,7 @@ async def handle_client(websocket):
                         "player": {k: v for k, v in p.items() if k != 'websocket'}
                     }, exclude=player_id)
 
-            elif msg_type == 'webrtc_offer' or msg_type == 'webrtc_answer' or msg_type == 'ice_candidate':
+            elif msg_type in ('webrtc_offer', 'webrtc_answer', 'ice_candidate'):
                 target = data.get('target')
                 if room_id in rooms and target in rooms[room_id]["players"]:
                     target_ws = rooms[room_id]["players"][target].get('websocket')
@@ -315,9 +315,27 @@ async def game_loop():
                     "health": player['health']
                 })
 
+# HTTP health check handler for Render
+async def health_check(path, request_headers):
+    """Handle HTTP requests (including Render health checks)"""
+    if path == "/health":
+        return (
+            HTTPStatus.OK,
+            [("Content-Type", "application/json")],
+            b'{"status": "alive", "players": ' + str(sum(len(r["players"]) for r in rooms.values())).encode() + b'}',
+        )
+    return None  # Let websockets handle WebSocket upgrades
+
 async def main():
-    async with websockets.serve(handle_client, "0.0.0.0", 8765):
+    # Use websockets.serve with process_request for HTTP health checks
+    async with websockets.serve(
+        handle_client,
+        "0.0.0.0",
+        8765,
+        process_request=health_check
+    ):
         print("Server started on ws://0.0.0.0:8765")
+        print("Health check: http://0.0.0.0:8765/health")
         print("Players can now create/join rooms!")
         await game_loop()
 
