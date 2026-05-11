@@ -246,7 +246,16 @@ async def handle_ws_message(ws, data, player_id, room_id):
                     "from": player_id
                 }))
 
-    elif msg_type == 'voice_request':
+    elif msg_type == 'chat':
+            if room_id in rooms and player_id in rooms[room_id]["players"]:
+                await broadcast(room_id, {
+                    "type": "chat",
+                    "from_name": rooms[room_id]["players"][player_id].get('name', 'Unknown'),
+                    "message": data.get('message', ''),
+                    "player_id": player_id
+                })
+
+        elif msg_type == 'voice_request':
         target = data.get('target')
         if room_id in rooms and target in rooms[room_id]["players"]:
             target_ws = rooms[room_id]["players"][target].get('websocket')
@@ -271,7 +280,7 @@ async def broadcast(room_id, message, exclude=None):
 
 async def game_loop():
     while True:
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.025)  # 40 FPS
         for room_id, room in list(rooms.items()):
             players_list = [{k: v for k, v in p.items() if k != 'websocket'} 
                           for p in room["players"].values()]
