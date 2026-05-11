@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import math
+import os
 from datetime import datetime
 
 # Try aiohttp first (better for Render), fallback to websockets
@@ -336,7 +337,7 @@ if USE_AIOHTTP:
         return ws
 
     async def health_handler(request):
-        """HTTP health check for Render"""
+        """HTTP health check for Render - aiohttp handles HEAD automatically with GET"""
         total_players = sum(len(r["players"]) for r in rooms.values())
         return web.json_response({
             "status": "alive",
@@ -347,8 +348,7 @@ if USE_AIOHTTP:
     async def main_aiohttp():
         app = web.Application()
         app.router.add_get('/ws', websocket_handler)
-        app.router.add_get('/health', health_handler)
-        app.router.add_head('/health', health_handler)  # HEAD for Render
+        app.router.add_get('/health', health_handler)  # HEAD is auto-handled by aiohttp
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -396,7 +396,6 @@ else:
             await game_loop()
 
 # ==================== MAIN ====================
-import os
 
 async def main():
     if USE_AIOHTTP:
