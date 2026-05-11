@@ -1,10 +1,16 @@
 import asyncio
-import websockets
 import json
 import random
 import math
 from datetime import datetime
-from http import HTTPStatus
+
+# Try aiohttp first (better for Render), fallback to websockets
+try:
+    from aiohttp import web
+    USE_AIOHTTP = True
+except ImportError:
+    import websockets
+    USE_AIOHTTP = False
 
 # Game state
 rooms = {}
@@ -108,164 +114,149 @@ def create_room(room_id, password=""):
     }
     return rooms[room_id]
 
-async def handle_client(websocket):
-    """WebSocket handler for game connections"""
-    player_id = None
-    room_id = None
+async def handle_ws_message(ws, data, player_id, room_id):
+    """Handle a single WebSocket message"""
+    msg_type = data.get('type')
 
-    try:
-        async for message in websocket:
-            data = json.loads(message)
-            msg_type = data.get('type')
+    if msg_type == 'create_room':
+        new_room_id = data.get('room_id', f"room_{random.randint(1000,9999)}")
+        password = data.get('password', '')
 
-            if msg_type == 'create_room':
-                new_room_id = data.get('room_id', f"room_{random.randint(1000,9999)}")
-                password = data.get('password', '')
+        if new_room_id in rooms:
+            await ws.send_str(json.dumps({
+                "type": "error",
+                "message": "Room already exists"
+            }))
+            return None, None
 
-                if new_room_id in rooms:
-                    await websocket.send(json.dumps({
-                        "type": "error",
-                        "message": "Room already exists"
-                    }))
-                    continue
+        room = create_room(new_room_id, password)
 
-                room = create_room(new_room_id, password)
+        await ws.send_str(json.dumps({
+            "type": "room_created",
+            "room_id": new_room_id,
+            "has_password": bool(password)
+        }))
+        return None, None
 
-                await websocket.send(json.dumps({
-                    "type": "room_created",
-                    "room_id": new_room_id,
-                    "has_password": bool(password)
-                }))
+    elif msg_type == 'join':
+        requested_room = data.get('room', 'default')
+        password = data.get('password', '')
+        player_id = data.get('player_id', f"player_{random.randint(1000,9999)}")
+        room_id = requested_room
 
-            elif msg_type == 'join':
-                requested_room = data.get('room', 'default')
-                password = data.get('password', '')
-                player_id = data.get('player_id', f"player_{random.randint(1000,9999)}")
-                room_id = requested_room
+        if room_id not in rooms:
+            await ws.send_str(json.dumps({
+                "type": "error",
+                "message": "Room not found"
+            }))
+            return player_id, None
 
-                if room_id not in rooms:
-                    await websocket.send(json.dumps({
-                        "type": "error",
-                        "message": "Room not found"
-                    }))
-                    continue
+        room = rooms[room_id]
+        if room["password"] and room["password"] != password:
+            await ws.send_str(json.dumps({
+                "type": "error",
+                "message": "Wrong password"
+            }))
+            return player_id, None
 
-                room = rooms[room_id]
-                if room["password"] and room["password"] != password:
-                    await websocket.send(json.dumps({
-                        "type": "error",
-                        "message": "Wrong password"
-                    }))
-                    continue
+        spawn_x, spawn_y = 2.5, 2.5
+        for y, row in enumerate(room["level_data"]):
+            for x, cell in enumerate(row):
+                if cell == 4:
+                    spawn_x, spawn_y = x + 0.5, y + 0.5
+                    break
 
-                spawn_x, spawn_y = 2.5, 2.5
-                for y, row in enumerate(room["level_data"]):
-                    for x, cell in enumerate(row):
-                        if cell == 4:
-                            spawn_x, spawn_y = x + 0.5, y + 0.5
-                            break
+        room["players"][player_id] = {
+            "id": player_id,
+            "x": spawn_x,
+            "y": spawn_y,
+            "vx": 0,
+            "vy": 0,
+            "dir": "down",
+            "frame": 0,
+            "health": 100,
+            "flashlight": True,
+            "artifacts": 0,
+            "websocket": ws,
+            "name": data.get('name', 'Unknown')
+        }
 
-                room["players"][player_id] = {
-                    "id": player_id,
-                    "x": spawn_x,
-                    "y": spawn_y,
-                    "vx": 0,
-                    "vy": 0,
-                    "dir": "down",
-                    "frame": 0,
-                    "health": 100,
-                    "flashlight": True,
-                    "artifacts": 0,
-                    "websocket": websocket,
-                    "name": data.get('name', 'Unknown')
-                }
+        await ws.send_str(json.dumps({
+            "type": "init",
+            "player_id": player_id,
+            "level": room["level_data"],
+            "players": {k: {kk: vv for kk, vv in v.items() if kk != 'websocket'} 
+                       for k, v in room["players"].items()}
+        }))
 
-                await websocket.send(json.dumps({
-                    "type": "init",
-                    "player_id": player_id,
-                    "level": room["level_data"],
-                    "players": {k: {kk: vv for kk, vv in v.items() if kk != 'websocket'} 
-                               for k, v in room["players"].items()}
-                }))
+        await broadcast(room_id, {
+            "type": "player_joined",
+            "player": {k: v for k, v in room["players"][player_id].items() if k != 'websocket'}
+        }, exclude=player_id)
 
-                await broadcast(room_id, {
-                    "type": "player_joined",
-                    "player": {k: v for k, v in room["players"][player_id].items() if k != 'websocket'}
-                }, exclude=player_id)
+        return player_id, room_id
 
-            elif msg_type == 'move':
-                if room_id in rooms and player_id in rooms[room_id]["players"]:
-                    p = rooms[room_id]["players"][player_id]
-                    p['x'] = data.get('x', p['x'])
-                    p['y'] = data.get('y', p['y'])
-                    p['vx'] = data.get('vx', 0)
-                    p['vy'] = data.get('vy', 0)
-                    p['dir'] = data.get('dir', p['dir'])
-                    p['frame'] = data.get('frame', p['frame'])
-
-                    level = rooms[room_id]["level_data"]
-                    gx, gy = int(p['x']), int(p['y'])
-                    if 0 <= gy < len(level) and 0 <= gx < len(level[0]):
-                        if level[gy][gx] == 2:
-                            level[gy][gx] = 0
-                            p['artifacts'] += 1
-                            rooms[room_id]["state"]["artifacts_found"] += 1
-                            await broadcast(room_id, {
-                                "type": "artifact_collected",
-                                "player_id": player_id,
-                                "x": gx,
-                                "y": gy,
-                                "total": rooms[room_id]["state"]["artifacts_found"]
-                            })
-
-                            if rooms[room_id]["state"]["artifacts_found"] >= rooms[room_id]["state"]["total_artifacts"]:
-                                await broadcast(room_id, {
-                                    "type": "game_win",
-                                    "message": "All artifacts found! Escape through the exit!"
-                                })
-
-                    if level[gy][gx] == 3 and rooms[room_id]["state"]["artifacts_found"] >= rooms[room_id]["state"]["total_artifacts"]:
-                        await broadcast(room_id, {"type": "level_complete"})
-
-                    await broadcast(room_id, {
-                        "type": "player_update",
-                        "player": {k: v for k, v in p.items() if k != 'websocket'}
-                    }, exclude=player_id)
-
-            elif msg_type in ('webrtc_offer', 'webrtc_answer', 'ice_candidate'):
-                target = data.get('target')
-                if room_id in rooms and target in rooms[room_id]["players"]:
-                    target_ws = rooms[room_id]["players"][target].get('websocket')
-                    if target_ws:
-                        await target_ws.send(json.dumps({
-                            **data,
-                            "from": player_id
-                        }))
-
-            elif msg_type == 'voice_request':
-                target = data.get('target')
-                if room_id in rooms and target in rooms[room_id]["players"]:
-                    target_ws = rooms[room_id]["players"][target].get('websocket')
-                    if target_ws:
-                        await target_ws.send(json.dumps({
-                            "type": "voice_request",
-                            "from": player_id,
-                            "from_name": rooms[room_id]["players"][player_id].get('name', 'Unknown')
-                        }))
-
-    except websockets.exceptions.ConnectionClosed:
-        pass
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
+    elif msg_type == 'move':
         if room_id in rooms and player_id in rooms[room_id]["players"]:
-            del rooms[room_id]["players"][player_id]
+            p = rooms[room_id]["players"][player_id]
+            p['x'] = data.get('x', p['x'])
+            p['y'] = data.get('y', p['y'])
+            p['vx'] = data.get('vx', 0)
+            p['vy'] = data.get('vy', 0)
+            p['dir'] = data.get('dir', p['dir'])
+            p['frame'] = data.get('frame', p['frame'])
+
+            level = rooms[room_id]["level_data"]
+            gx, gy = int(p['x']), int(p['y'])
+            if 0 <= gy < len(level) and 0 <= gx < len(level[0]):
+                if level[gy][gx] == 2:
+                    level[gy][gx] = 0
+                    p['artifacts'] += 1
+                    rooms[room_id]["state"]["artifacts_found"] += 1
+                    await broadcast(room_id, {
+                        "type": "artifact_collected",
+                        "player_id": player_id,
+                        "x": gx,
+                        "y": gy,
+                        "total": rooms[room_id]["state"]["artifacts_found"]
+                    })
+
+                    if rooms[room_id]["state"]["artifacts_found"] >= rooms[room_id]["state"]["total_artifacts"]:
+                        await broadcast(room_id, {
+                            "type": "game_win",
+                            "message": "All artifacts found! Escape through the exit!"
+                        })
+
+            if level[gy][gx] == 3 and rooms[room_id]["state"]["artifacts_found"] >= rooms[room_id]["state"]["total_artifacts"]:
+                await broadcast(room_id, {"type": "level_complete"})
+
             await broadcast(room_id, {
-                "type": "player_left",
-                "player_id": player_id
-            })
-            if len(rooms[room_id]["players"]) == 0:
-                del rooms[room_id]
+                "type": "player_update",
+                "player": {k: v for k, v in p.items() if k != 'websocket'}
+            }, exclude=player_id)
+
+    elif msg_type in ('webrtc_offer', 'webrtc_answer', 'ice_candidate'):
+        target = data.get('target')
+        if room_id in rooms and target in rooms[room_id]["players"]:
+            target_ws = rooms[room_id]["players"][target].get('websocket')
+            if target_ws:
+                await target_ws.send_str(json.dumps({
+                    **data,
+                    "from": player_id
+                }))
+
+    elif msg_type == 'voice_request':
+        target = data.get('target')
+        if room_id in rooms and target in rooms[room_id]["players"]:
+            target_ws = rooms[room_id]["players"][target].get('websocket')
+            if target_ws:
+                await target_ws.send_str(json.dumps({
+                    "type": "voice_request",
+                    "from": player_id,
+                    "from_name": rooms[room_id]["players"][player_id].get('name', 'Unknown')
+                }))
+
+    return player_id, room_id
 
 async def broadcast(room_id, message, exclude=None):
     if room_id not in rooms:
@@ -273,7 +264,7 @@ async def broadcast(room_id, message, exclude=None):
     for pid, player in rooms[room_id]["players"].items():
         if pid != exclude and 'websocket' in player:
             try:
-                await player['websocket'].send(json.dumps(message))
+                await player['websocket'].send_str(json.dumps(message))
             except:
                 pass
 
@@ -315,29 +306,103 @@ async def game_loop():
                     "health": player['health']
                 })
 
-# HTTP health check handler for Render
-async def health_check(path, request_headers):
-    """Handle HTTP requests (including Render health checks)"""
-    if path == "/health":
-        return (
-            HTTPStatus.OK,
-            [("Content-Type", "application/json")],
-            b'{"status": "alive", "players": ' + str(sum(len(r["players"]) for r in rooms.values())).encode() + b'}',
-        )
-    return None  # Let websockets handle WebSocket upgrades
+# ==================== AIOHTTP VERSION (for Render) ====================
+if USE_AIOHTTP:
+    async def websocket_handler(request):
+        """Handle WebSocket connections via aiohttp"""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        player_id = None
+        room_id = None
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    player_id, room_id = await handle_ws_message(ws, data, player_id, room_id)
+                elif msg.type == web.WSMsgType.ERROR:
+                    print(f'WebSocket error: {ws.exception()}')
+        finally:
+            if room_id in rooms and player_id in rooms[room_id]["players"]:
+                del rooms[room_id]["players"][player_id]
+                await broadcast(room_id, {
+                    "type": "player_left",
+                    "player_id": player_id
+                })
+                if len(rooms[room_id]["players"]) == 0:
+                    del rooms[room_id]
+
+        return ws
+
+    async def health_handler(request):
+        """HTTP health check for Render"""
+        total_players = sum(len(r["players"]) for r in rooms.values())
+        return web.json_response({
+            "status": "alive",
+            "players": total_players,
+            "rooms": len(rooms)
+        })
+
+    async def main_aiohttp():
+        app = web.Application()
+        app.router.add_get('/ws', websocket_handler)
+        app.router.add_get('/health', health_handler)
+        app.router.add_head('/health', health_handler)  # HEAD for Render
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+
+        port = int(os.environ.get('PORT', 8765))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+
+        print(f"AioHTTP server started on port {port}")
+        print(f"WebSocket: ws://0.0.0.0:{port}/ws")
+        print(f"Health: http://0.0.0.0:{port}/health")
+
+        await game_loop()
+
+# ==================== WEBSOCKETS VERSION (fallback) ====================
+else:
+    import websockets
+
+    async def handle_client(websocket):
+        """WebSocket handler for websockets library"""
+        player_id = None
+        room_id = None
+
+        try:
+            async for message in websocket:
+                data = json.loads(message)
+                player_id, room_id = await handle_ws_message(websocket, data, player_id, room_id)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except Exception as e:
+            print(f"Error: {e}")
+        finally:
+            if room_id in rooms and player_id in rooms[room_id]["players"]:
+                del rooms[room_id]["players"][player_id]
+                await broadcast(room_id, {
+                    "type": "player_left",
+                    "player_id": player_id
+                })
+                if len(rooms[room_id]["players"]) == 0:
+                    del rooms[room_id]
+
+    async def main_websockets():
+        async with websockets.serve(handle_client, "0.0.0.0", 8765):
+            print("WebSockets server started on ws://0.0.0.0:8765")
+            await game_loop()
+
+# ==================== MAIN ====================
+import os
 
 async def main():
-    # Use websockets.serve with process_request for HTTP health checks
-    async with websockets.serve(
-        handle_client,
-        "0.0.0.0",
-        8765,
-        process_request=health_check
-    ):
-        print("Server started on ws://0.0.0.0:8765")
-        print("Health check: http://0.0.0.0:8765/health")
-        print("Players can now create/join rooms!")
-        await game_loop()
+    if USE_AIOHTTP:
+        await main_aiohttp()
+    else:
+        await main_websockets()
 
 if __name__ == "__main__":
     asyncio.run(main())
